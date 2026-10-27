@@ -414,17 +414,19 @@ Runner.style = css`
 
 let authStore: Stateful<{
 	token: Token | undefined;
+	offlineName: string;
 }> = createStore(
 	{
 		token: undefined,
+		offlineName: "Player",
 	},
-	// Live/SISU tokens belong to a different client ID than the old Entra flow.
-	{ ident: "ikvmcraft-auth-sisu-1", autosave: "auto", backing: "localstorage" }
+	{ ident: "ikvmcraft-auth-1", autosave: "auto", backing: "localstorage" }
 );
 
 type AuthState =
 	| { type: "loading" }
 	| { type: "ready" }
+	| { type: "offline"; name: string }
 	| { type: "authing"; url: string; qr: string }
 	| {
 			type: "done";
@@ -444,6 +446,7 @@ function Launcher(
 		{
 			fsOpen: boolean;
 			authState: AuthState;
+			offlineName: string;
 		}
 	>
 ) {
@@ -451,10 +454,11 @@ function Launcher(
 		fab = this.fabric;
 
 	this.fsOpen = false;
+	this.offlineName = "Player";
 	this.authState = { type: "loading" } as AuthState;
 
 	let readyToPlay = use(this.authState).map(
-		(x) => import.meta.env.DEV || x.type === "done"
+		(x) => import.meta.env.DEV || x.type === "done" || x.type === "offline"
 	);
 
 	let populateToken = async (token: Token) => {
@@ -474,6 +478,7 @@ function Launcher(
 	};
 
 	this.cx.mount = async () => {
+		this.offlineName = authStore.offlineName || "Player";
 		let token: Token | undefined;
 		if (!(token = authStore.token)) {
 			this.authState = { type: "ready" };
@@ -485,7 +490,6 @@ function Launcher(
 				authStore.token = token = await refreshToken(token.refresh);
 			} catch (e) {
 				this.authState = { type: "error", error: e };
-				return;
 			}
 		}
 
@@ -508,12 +512,32 @@ function Launcher(
 			this.authState = { type: "error", error: err };
 		}
 	};
+	let offlineAuth = () => {
+		const name = this.offlineName.trim();
+		if (!/^[A-Za-z0-9_]{3,16}$/.test(name)) {
+			this.authState = {
+				type: "error",
+				error: "Choose a username of 3–16 characters using only letters, numbers, or underscores.",
+			};
+			return;
+		}
+		authStore.offlineName = name;
+		this.authState = { type: "offline", name };
+	};
 	let deauth = async () => {
 		authStore.token = undefined;
 		this.authState = { type: "ready" };
 	};
 
 	let authInfo = (): MinecraftAuthInfo => {
+		if (this.authState.type === "offline") {
+			return {
+				playerName: this.authState.name,
+				uuid: "",
+				accessToken: "0",
+				userType: "legacy",
+			};
+		}
 		if (this.authState.type === "done") {
 			return {
 				playerName: this.authState.name,
@@ -545,10 +569,12 @@ function Launcher(
 				allowing for full mods support but resulting in some performance loss.
 			</p>
 			<p>
-				You will need to own Minecraft on a Microsoft account and sign in to use
-				this port. It will download Minecraft automatically into the browser
-				filesystem before launching. The port supports all versions of Minecraft
-				from 1.13 to 26.2, with more coming soon.
+				Sign in with a Microsoft account to use your licensed profile, or choose an
+			offline username for single-player play and servers that explicitly allow
+			offline-mode accounts. Offline profiles cannot join Realms or servers that
+			require Microsoft authentication. Minecraft files will be downloaded into
+			the browser filesystem before launching. The port supports versions 1.13
+				through 26.2.
 			</p>
 			<p>
 				The source is available on{" "}
@@ -569,13 +595,37 @@ function Launcher(
 						if (x.type === "loading") return <span>Loading auth state...</span>;
 						else if (x.type === "ready")
 							return (
-								<Button type="primary" icon="left" on:click={auth}>
-									<Icon icon={iconLogin} />
-									Log In
-								</Button>
+								<div class="auth-methods">
+									<Button type="primary" icon="left" on:click={auth}>
+										<Icon icon={iconLogin} />
+										Log In with Microsoft
+									</Button>
+									<div class="offline-login">
+										<label class="offline-label">
+											Offline username
+											<TextField
+												value={use(this.offlineName)}
+												placeholder="PlayerName"
+												class="offline-username"
+												 on:input={(event) => {
+													this.offlineName = (event.target as HTMLInputElement).value;
+												}}
+											/>
+										</label>
+										<Button type="normal" on:click={offlineAuth}>
+											Use Offline Account
+										</Button>
+										<small>
+											Only for single-player or servers configured to allow offline-mode
+											players. Realms and authenticated servers will not work.
+										</small>
+									</div>
+								</div>
 							);
 						else if (x.type === "done")
 							return <span>Logged in as {x.name}</span>;
+						else if (x.type === "offline")
+							return <span>Using offline profile: {x.name}</span>;
 						else if (x.type === "authing")
 							return (
 								<div>
@@ -588,7 +638,18 @@ function Launcher(
 									<img class="qr" src={x.qr} />
 								</div>
 							);
-						else if (x.type === "error") return <span>Error: {x.error}</span>;
+						else if (x.type === "error")
+							return (
+								<div class="auth-error">
+									<span>Error: {String(x.error)}</span>
+									<Button
+										type="normal"
+										on:click={() => (this.authState = { type: "ready" })}
+									>
+										Back
+									</Button>
+								</div>
+							);
 					})}
 				</div>
 			</div>
@@ -655,6 +716,45 @@ Launcher.style = css`
 		flex-direction: column;
 		gap: 1rem;
 		align-items: start;
+	}
+
+	.auth-methods {
+		display: flex;
+		flex-direction: column;
+		align-items: start;
+		gap: 1rem;
+	}
+
+	.offline-login {
+		display: flex;
+		flex-direction: column;
+		align-items: start;
+		gap: 0.5rem;
+		max-width: 24rem;
+	}
+
+	.offline-label {
+		display: flex;
+		flex-direction: column;
+		gap: 0.35rem;
+		width: 100%;
+	}
+
+	.offline-label .offline-username {
+		width: 100%;
+		box-sizing: border-box;
+	}
+
+	.auth-error {
+		display: flex;
+		flex-direction: column;
+		align-items: start;
+		gap: 0.75rem;
+	}
+
+	.offline-login small {
+		color: var(--surface5);
+		line-height: 1.4;
 	}
 
 	.auth .qr {
