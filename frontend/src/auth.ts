@@ -1,10 +1,7 @@
 import encodeQR from "qr";
 import { client } from "./net";
 
-const CLIENT_ID = "00000000402b5328";
-const LIVE_SCOPE = "service::user.auth.xboxlive.com::MBI_SSL";
-const LIVE_DEVICE_CODE_URL = "https://login.live.com/oauth20_connect.srf";
-const LIVE_TOKEN_URL = "https://login.live.com/oauth20_token.srf";
+const CLIENT_ID = "c36a9fb6-4f2a-41ff-90bd-ae7cc92031eb";
 
 interface DeviceCodeResponse {
 	device_code: string;
@@ -19,7 +16,7 @@ interface OAuthResponse {
 	token_type: string;
 	expires_in: number;
 	scope: string;
-	refresh_token?: string;
+	refresh_token: string;
 }
 
 interface AuthErrorResponse {
@@ -35,12 +32,8 @@ function authErrorMessage(json: AuthErrorResponse): string {
 		switch (json.XErr) {
 			case 2148916227:
 				return "xsts says this account is banned from xbox";
-			case 2148916229:
-				return "xsts says this account needs permission from its family organizer";
 			case 2148916233:
 				return "xsts says this account does not have a xbox account";
-			case 2148916234:
-				return "xsts says this account must accept the Xbox terms of service";
 			case 2148916235:
 				return "xsts says xbox live is not available in this account's country";
 			case 2148916236:
@@ -61,8 +54,7 @@ async function authRequest<T>(
 	context: string,
 	url: string,
 	options?: RequestInit,
-	allowedErrors: readonly string[] = [],
-	onResponse?: (response: Response) => void
+	allowedErrors: readonly string[] = []
 ): Promise<T> {
 	let res: Response;
 	try {
@@ -73,14 +65,8 @@ async function authRequest<T>(
 			{ cause: error }
 		);
 	}
-	onResponse?.(res);
 
 	const status = `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`;
-	// Xbox can return its error code in a header with an empty response body.
-	const xboxError = Number(res.headers.get("x-err"));
-	if (!res.ok && xboxError) {
-		throw new Error(`${context} failed (${status}): ${authErrorMessage({ XErr: xboxError })}`);
-	}
 	let json: unknown;
 	try {
 		json = await res.json();
@@ -116,28 +102,25 @@ interface DeviceCodeResult {
 	token: Promise<Token>;
 }
 
-function convertOAuthResponse(res: OAuthResponse, previousRefresh?: string): Token {
-	const refresh = res.refresh_token ?? previousRefresh;
+function convertOAuthResponse(res: OAuthResponse): Token {
 	if (
 		typeof res.access_token !== "string" || !res.access_token
-		|| typeof refresh !== "string" || !refresh
+		|| typeof res.refresh_token !== "string" || !res.refresh_token
 		|| !Number.isFinite(res.expires_in) || res.expires_in <= 0
 	) {
 		throw new Error("Microsoft authentication returned incomplete token information.");
 	}
 	return {
 		access: res.access_token,
-		refresh,
+		refresh: res.refresh_token,
 		expires: Date.now() + res.expires_in * 1000,
 	};
 }
 
 export async function deviceCodeAuth(): Promise<DeviceCodeResult> {
-	const requestedAt = Date.now();
-	let cookie = "";
 	const deviceCodeData = await authRequest<DeviceCodeResponse>(
 		"Microsoft device code request",
-		LIVE_DEVICE_CODE_URL,
+		"https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode",
 		{
 			method: "POST",
 			headers: {
@@ -145,41 +128,33 @@ export async function deviceCodeAuth(): Promise<DeviceCodeResult> {
 			},
 			body: new URLSearchParams({
 				client_id: CLIENT_ID,
-				scope: LIVE_SCOPE,
-				response_type: "device_code",
+				scope: "XboxLive.signin offline_access",
 			}).toString(),
-		},
-		[],
-		(response) => {
-			// Epoxy transports HTTP outside browser fetch's cookie handling.
-			const cookies = response.headers.getSetCookie?.();
-			cookie = (cookies?.length ? cookies : [response.headers.get("set-cookie") ?? ""])
-				.map((value) => value.split(";", 1)[0]).filter(Boolean).join("; ");
 		}
 	);
 
-	const { device_code, user_code, verification_uri, interval, expires_in } = deviceCodeData;
+	const { device_code, user_code, verification_uri, interval } = deviceCodeData;
 
-	if (!device_code || !user_code || !verification_uri
-		|| !Number.isFinite(interval) || interval <= 0
-		|| !Number.isFinite(expires_in) || expires_in <= 0) {
+	if (!device_code || !user_code || !verification_uri || !Number.isFinite(interval) || interval <= 0) {
 		throw new Error("Failed to obtain device code information.");
 	}
 	const tokenGenerator = async () => {
-		const expiresAt = requestedAt + expires_in * 1000;
-		let pollIntervalMs = interval * 1000;
+		// poll the token endpoint until the user completes the authentication
+		let tokenData: OAuthResponse | null = null;
 
-		while (Date.now() < expiresAt) {
-			await new Promise((resolve) => setTimeout(resolve, Math.min(pollIntervalMs, expiresAt - Date.now())));
-			if (Date.now() >= expiresAt) break;
-			const pollingResponse = await authRequest<OAuthResponse & AuthErrorResponse>(
+		interface TokenPollingResponse {
+			access_token?: string;
+			error?: string;
+		}
+
+		while (!tokenData?.access_token) {
+			const pollingResponse = await authRequest<TokenPollingResponse>(
 				"Microsoft token polling",
-				`${LIVE_TOKEN_URL}?client_id=${CLIENT_ID}`,
+				"https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
 				{
 					method: "POST",
 					headers: {
 						"Content-Type": "application/x-www-form-urlencoded",
-						...(cookie ? { Cookie: cookie } : {}),
 					},
 					body: new URLSearchParams({
 						client_id: CLIENT_ID,
@@ -187,19 +162,20 @@ export async function deviceCodeAuth(): Promise<DeviceCodeResult> {
 						device_code: device_code,
 					}).toString(),
 				},
-				["authorization_pending", "slow_down"]
+				["authorization_pending"]
 			);
 
 			if (pollingResponse.access_token) {
-				return convertOAuthResponse(pollingResponse);
-			} else if (pollingResponse.error === "slow_down") {
-				pollIntervalMs += 5000;
-			} else if (pollingResponse.error !== "authorization_pending") {
+				tokenData = pollingResponse as OAuthResponse;
+			} else if (pollingResponse.error === "authorization_pending") {
+				// user has not completed the authentication yet; wait for the interval
+				await new Promise((resolve) => setTimeout(resolve, interval * 1000));
+			} else {
 				throw new Error("Microsoft token polling did not return a token.");
 			}
 		}
 
-		throw new Error("Microsoft sign-in code expired. Please sign in again.");
+		return convertOAuthResponse(tokenData);
 	};
 	return { url: verification_uri, code: user_code, token: tokenGenerator() };
 }
@@ -207,19 +183,18 @@ export async function deviceCodeAuth(): Promise<DeviceCodeResult> {
 export async function refreshToken(refresh: string): Promise<Token> {
 	const json = await authRequest<OAuthResponse>(
 		"Microsoft token refresh",
-		LIVE_TOKEN_URL,
+		"https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
 		{
 			method: "POST",
 			headers: { "Content-Type": "application/x-www-form-urlencoded" },
 			body: new URLSearchParams({
 				client_id: CLIENT_ID,
-				scope: LIVE_SCOPE,
 				grant_type: "refresh_token",
 				refresh_token: refresh,
-			}).toString(),
+			}),
 		}
 	);
-	return convertOAuthResponse(json, refresh);
+	return convertOAuthResponse(json);
 }
 
 type AuthCodeResult = DeviceCodeResult & {
@@ -243,98 +218,63 @@ export async function startDeviceCodeAuth(): Promise<AuthCodeResult> {
 	};
 }
 
-async function signedXboxRequest<T>(
-	context: string,
-	url: string,
-	payload: object,
-	privateKey: CryptoKey,
-	contractVersion?: string
-): Promise<T> {
-	const body = JSON.stringify(payload);
-	// Xbox signature policy 1: big-endian version and Windows FILETIME, then
-	// NUL-delimited HTTP method, path, authorization header (empty), and UTF-8 body.
-	const timestamp = BigInt(Date.now()) * 10000n + 116444736000000000n;
-	const fields = new TextEncoder().encode(`POST\0${new URL(url).pathname}\0\0${body}\0`);
-	const message = new Uint8Array(14 + fields.length);
-	const messageView = new DataView(message.buffer);
-	messageView.setUint32(0, 1);
-	messageView.setBigUint64(5, timestamp);
-	message.set(fields, 14);
-	const signature = new Uint8Array(await crypto.subtle.sign(
-		{ name: "ECDSA", hash: "SHA-256" }, privateKey, message
-	));
-	// WebCrypto returns the fixed-width r || s signature Xbox expects (not DER).
-	const header = new Uint8Array(12 + signature.length);
-	const headerView = new DataView(header.buffer);
-	headerView.setUint32(0, 1);
-	headerView.setBigUint64(4, timestamp);
-	header.set(signature, 12);
-	return authRequest<T>(context, url, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			Accept: "application/json",
-			Signature: btoa(String.fromCharCode(...header)),
-			...(contractVersion ? { "x-xbl-contract-version": contractVersion } : {}),
-		},
-		body,
-	});
+async function xboxAuth(msToken: string): Promise<string> {
+	const json = await authRequest<{ Token?: string }>(
+		"Xbox Live authentication",
+		"https://user.auth.xboxlive.com/user/authenticate",
+		{
+			headers: {
+				"Content-Type": "application/json",
+				Accept: "application/json",
+			},
+			method: "POST",
+			body: `{
+			"Properties": {
+				"AuthMethod": "RPS",
+				"SiteName": "user.auth.xboxlive.com",
+				"RpsTicket": "d=${msToken}"
+			},
+			"RelyingParty": "http://auth.xboxlive.com",
+			"TokenType": "JWT"
+ 		}`,
+		}
+	);
+	if (!json["Token"]) throw new Error("xbox live did not return a token");
+
+	return json["Token"];
 }
 
-async function sisuAuth(msToken: string): Promise<{ token: string; userHash: string }> {
-	// The same proof key signs device authentication and SISU authorization.
-	// The private key stays in memory and is never exported or persisted.
-	const keys = await crypto.subtle.generateKey(
-		{ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]
-	);
-	const { kty, crv, x, y } = await crypto.subtle.exportKey("jwk", keys.publicKey);
-	const proofKey = { kty, crv, x, y, alg: "ES256", use: "sig" };
-	const device = await signedXboxRequest<{ Token?: string }>(
-		"Xbox device authentication",
-		"https://device.auth.xboxlive.com/device/authenticate",
-		{
-			Properties: {
-				AuthMethod: "ProofOfPossession",
-				Id: `{${crypto.randomUUID()}}`,
-				DeviceType: "Win32",
-				SerialNumber: `{${crypto.randomUUID()}}`,
-				Version: "0.0.0",
-				ProofKey: proofKey,
-			},
-			RelyingParty: "http://auth.xboxlive.com",
-			TokenType: "JWT",
-		},
-		keys.privateKey,
-		"1"
-	);
-	if (typeof device.Token !== "string" || !device.Token) {
-		throw new Error("Xbox device authentication did not return a token.");
-	}
-	const sisu = await signedXboxRequest<{
-		AuthorizationToken?: {
-			Token?: string;
-			DisplayClaims?: { xui?: { uhs?: string }[] };
-		};
+async function xstsAuth(
+	xboxToken: string
+): Promise<{ token: string; userHash: string }> {
+	const json = await authRequest<{
+		Token?: string;
+		DisplayClaims?: { xui?: { uhs?: string }[] };
 	}>(
-		"Xbox SISU authorization",
-		"https://sisu.xboxlive.com/authorize",
+		"XSTS authorization",
+		"https://xsts.auth.xboxlive.com/xsts/authorize",
 		{
-			AccessToken: `t=${msToken}`,
-			AppId: CLIENT_ID,
-			DeviceToken: device.Token,
-			Sandbox: "RETAIL",
-			UseModernGamertag: true,
-			SiteName: "user.auth.xboxlive.com",
-			RelyingParty: "rp://api.minecraftservices.com/",
-			ProofKey: proofKey,
-		},
-		keys.privateKey
+			headers: {
+				"Content-Type": "application/json",
+				Accept: "application/json",
+			},
+			method: "POST",
+			body: JSON.stringify({
+				Properties: {
+					SandboxId: "RETAIL",
+					UserTokens: [xboxToken],
+				},
+				RelyingParty: "rp://api.minecraftservices.com/",
+				TokenType: "JWT",
+			}),
+		}
 	);
-	const token = sisu.AuthorizationToken?.Token;
-	const userHash = sisu.AuthorizationToken?.DisplayClaims?.xui?.[0]?.uhs;
-	if (typeof token !== "string" || !token || typeof userHash !== "string" || !userHash) {
-		throw new Error("Xbox SISU authorization did not return a token and user hash.");
-	}
+
+	const token = json["Token"];
+	if (!token) throw new Error("xsts did not return a token");
+	const userHash = json.DisplayClaims?.xui?.[0]?.uhs;
+	if (!userHash) throw new Error("xsts did not return user hash");
+
 	return { token, userHash };
 }
 
@@ -415,6 +355,7 @@ export async function getProfile(mcToken: string): Promise<UserInfo> {
 }
 
 export async function minecraftAuth(msToken: string): Promise<string> {
-	const xstsInfo = await sisuAuth(msToken);
+	const xboxToken = await xboxAuth(msToken);
+	const xstsInfo = await xstsAuth(xboxToken);
 	return mcAuth(xstsInfo.token, xstsInfo.userHash);
 }
