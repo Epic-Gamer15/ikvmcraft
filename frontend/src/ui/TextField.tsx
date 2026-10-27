@@ -3,6 +3,7 @@ import { css, type FC } from "dreamland/core";
 export function TextField(
 	this: FC<{
 		"on:keydown"?: (event: KeyboardEvent) => void;
+		"on:input"?: (event: Event) => void;
 		value: string;
 		placeholder?: string;
 		class?: string;
@@ -18,6 +19,7 @@ export function TextField(
 			placeholder={use(this.placeholder)}
 			value={use(this.value)}
 			on:keydown={this["on:keydown"] || (() => {})}
+			on:input={this["on:input"] || (() => {})}
 		/>
 	);
 }
